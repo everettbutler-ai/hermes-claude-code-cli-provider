@@ -71,7 +71,27 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # Model ids the shim advertises and forwards verbatim to `claude --model`.
-ADVERTISED_MODELS = ("opus", "sonnet", "haiku")
+ADVERTISED_MODELS = ("opus", "sonnet", "haiku", "fable")
+
+# Model strings the CLI accepts syntactically but does NOT resolve to the model
+# they name -- it silently serves a fallback instead. `claude-fable-5` is the
+# worst case: the CLI accepts it, returns 200, and bills Haiku 4.5 + Opus 4.8.
+# The public aliases that actually resolve to Fable are `fable` and the pinned
+# 1M form `claude-fable-5[1m]`, so normalize the phantom spelling before invoking.
+_MODEL_ALIASES = {
+    "claude-fable-5": "fable",
+    "claude-fable5": "fable",
+    "fable-5": "fable",
+    "claude-fable-5-mythos-5": "fable",
+    "mythos": "fable",
+    "claude-mythos-5": "fable",
+}
+
+
+def normalize_model(model: str) -> str:
+    """Map a known-phantom model spelling onto the alias the CLI truly resolves."""
+    key = (model or "").strip()
+    return _MODEL_ALIASES.get(key.lower(), key)
 
 
 # --------------------------------------------------------------------------- #
@@ -1417,6 +1437,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         model = str(body.get("model") or _env("CLAUDE_CODE_CLI_MODEL", "sonnet")).strip() or "sonnet"
+        model = normalize_model(model)
         stream = bool(body.get("stream"))
         include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
 
