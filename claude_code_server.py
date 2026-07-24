@@ -1153,6 +1153,85 @@ def build_tool_call_stream_chunks(model: str, tool_calls: list[dict], usage: dic
 
 
 # --------------------------------------------------------------------------- #
+# CLI failure -> HTTP status classification
+# --------------------------------------------------------------------------- #
+# The Claude Code CLI reports every failure mode -- expired subscription auth,
+# usage limits, a missing/invalid model, a missing binary, a hung invocation --
+# as ordinary result text with exit code 0. If the shim forwards that text
+# inside a 200 completion envelope, Hermes never raises: agent/error_classifier
+# is never consulted, should_fallback is never set, and the configured fallback
+# chain (e.g. Opus 5 -> Sol 5.6) is silently skipped. The agent just prints the
+# error string as its answer.
+#
+# Mapping these to real HTTP statuses restores failover parity with the
+# openai-codex provider, which already returns 401/404/429/5xx natively.
+
+_CLI_MODEL_PATTERNS = (
+    "issue with the selected model",
+    "model not found",
+    "invalid model",
+    "unknown model",
+    "unsupported model",
+    "may not exist",
+    "does not exist",
+    "you may not have access",
+    "pick a different model",
+)
+
+_CLI_AUTH_PATTERNS = (
+    "invalid api key",
+    "authentication_error",
+    "unauthorized",
+    "not authenticated",
+    "not logged in",
+    "please run /login",
+    "claude login",
+    "log in to claude",
+    "session expired",
+    "token expired",
+    "token has expired",
+    "oauth token",
+    "revoked",
+)
+
+_CLI_RATE_PATTERNS = (
+    "rate limit",
+    "rate_limit",
+    "too many requests",
+    "usage limit",
+    "quota",
+    "overloaded",
+    "at capacity",
+    "credit balance",
+    "insufficient credits",
+    "upgrade to",
+)
+
+
+def classify_cli_error(msg: str) -> tuple:
+    """Map a claude-code-cli failure string to (status, error_type, message).
+
+    The message is normalized where the CLI's wording would miss Hermes'
+    pattern lists -- the CLI says "It may not exist", but Hermes'
+    _MODEL_NOT_FOUND_PATTERNS looks for "model not found" / "does not exist".
+    Without the prefix a 404 falls through to the generic bucket (unknown,
+    retryable, no fallback) and failover still never fires.
+    """
+    raw = (msg or "").strip() or "claude-code-cli failed"
+    low = raw.lower()
+    if any(p in low for p in _CLI_MODEL_PATTERNS):
+        return 404, "model_not_found", "model not found: " + raw
+    if any(p in low for p in _CLI_AUTH_PATTERNS):
+        return 401, "authentication_error", raw
+    if any(p in low for p in _CLI_RATE_PATTERNS):
+        return 429, "rate_limit_error", raw
+    # Timeouts, missing binary, non-zero exit, empty output: the backend is
+    # unusable right now. 503 -> FailoverReason.overloaded (retryable, then
+    # fallback) instead of a silent 200.
+    return 503, "service_unavailable", raw
+
+
+# --------------------------------------------------------------------------- #
 # HTTP handler
 # --------------------------------------------------------------------------- #
 class Handler(BaseHTTPRequestHandler):
@@ -1169,6 +1248,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_error(self, status: int, message: str, etype: str = "invalid_request_error") -> None:
         self._send_json(status, {"error": {"message": message, "type": etype}})
+
+    def _send_cli_failure(self, error_msg: str) -> None:
+        """Return a claude-code-cli failure as a real HTTP error, not a 200.
+
+        A 200 completion carrying error text is invisible to Hermes' failover
+        machinery: nothing raises, error_classifier never runs, should_fallback
+        is never set, and the configured fallback chain is skipped entirely.
+        """
+        status, etype, msg = classify_cli_error(error_msg)
+        self.log_message("cli failure -> HTTP %s (%s): %s", status, etype, msg[:200])
+        self._send_error(status, msg, etype)
 
     def log_message(self, fmt, *args):  # quieter, single-line logs to stderr
         sys.stderr.write("[claude-code-cli] " + (fmt % args) + "\n")
@@ -1252,22 +1342,27 @@ class Handler(BaseHTTPRequestHandler):
                 # stream:true clients, emit standard OpenAI tool-call SSE chunks
                 # after parsing instead of token text deltas.
                 outcome = run_claude(prompt, model, engine=False, overrides=overrides)
-                tool_calls = [] if outcome["error"] else extract_native_tool_calls(outcome["text"], tools)
-                if tool_calls:
-                    if stream:
-                        self._stream_tool_call_response(model, tool_calls, outcome["usage"], include_usage)
-                    else:
-                        self._send_json(200, build_tool_call_completion(model, tool_calls, outcome["usage"]))
+                if outcome["error"]:
+                    self._send_cli_failure(outcome["error"])
                 else:
-                    if stream:
-                        self._stream_response(model, outcome, include_usage)
+                    tool_calls = extract_native_tool_calls(outcome["text"], tools)
+                    if tool_calls:
+                        if stream:
+                            self._stream_tool_call_response(model, tool_calls, outcome["usage"], include_usage)
+                        else:
+                            self._send_json(200, build_tool_call_completion(model, tool_calls, outcome["usage"]))
                     else:
-                        self._send_json(200, build_completion(model, outcome["text"], outcome["usage"]))
+                        if stream:
+                            self._stream_response(model, outcome, include_usage)
+                        else:
+                            self._send_json(200, build_completion(model, outcome["text"], outcome["usage"]))
             elif stream and _real_streaming_enabled():
                 outcome = self._stream_live_response(model, prompt, engine, overrides, include_usage)
             else:
                 outcome = run_claude(prompt, model, engine, overrides)
-                if stream:
+                if outcome["error"]:
+                    self._send_cli_failure(outcome["error"])
+                elif stream:
                     self._stream_response(model, outcome, include_usage)
                 else:
                     self._send_json(200, build_completion(model, outcome["text"], outcome["usage"]))
@@ -1336,20 +1431,38 @@ class Handler(BaseHTTPRequestHandler):
                 payload["usage"] = usage_obj
             return payload
 
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.end_headers()
         outcome = {"text": "", "usage": _zero_usage(), "error": "stream ended before final event"}
-        try:
+        headers_sent = False
+
+        def open_stream() -> None:
+            # Deferred so a CLI failure that produces zero tokens can still be
+            # returned as a real HTTP error. Once the 200 status line is on the
+            # wire it cannot be taken back, and Hermes' failover never fires.
+            nonlocal headers_sent
+            if headers_sent:
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            headers_sent = True
             self._write_sse(chunk({"role": "assistant"}))
+
+        try:
             for kind, payload in stream_claude(prompt, model, engine, overrides):
                 if kind == "delta":
+                    open_stream()
                     self._write_sse(chunk({"content": payload}))
                 elif kind == "final" and isinstance(payload, dict):
                     outcome = payload
                     break
+            if outcome["error"] and not headers_sent:
+                # Auth expiry, usage limit, bad model, dead binary, timeout:
+                # nothing streamed, so surface a status Hermes can classify.
+                self._send_cli_failure(outcome["error"])
+                return outcome
+            open_stream()
             self._write_sse(chunk({}, finish="stop"))
             if include_usage:
                 self._write_sse({
