@@ -745,11 +745,25 @@ def run_claude(prompt: str, model: str, engine: bool = False, overrides: dict | 
         if parsed.get("is_error"):
             msg = str(parsed.get("result") or parsed.get("error") or "claude reported is_error")
             return {"text": f"[claude-code-cli error] {msg}", "usage": _map_usage(parsed.get("usage")), "error": msg}
+        served = _extract_served_model(parsed, model)
+        substitution = check_model_provenance(model, served)
+        if substitution:
+            return {
+                "text": f"[claude-code-cli error] {substitution}",
+                "usage": _map_usage(parsed.get("usage")),
+                "error": substitution,
+                "model": served,
+            }
         result = parsed.get("result")
         if not isinstance(result, str):
             result = parsed.get("content")
         if isinstance(result, str) and result.strip():
-            return {"text": result.strip(), "usage": _map_usage(parsed.get("usage")), "error": ""}
+            return {
+                "text": result.strip(),
+                "usage": _map_usage(parsed.get("usage")),
+                "error": "",
+                "model": served,
+            }
 
     # Non-zero exit with no parseable result → surface stderr/stdout tail.
     if proc.returncode != 0:
@@ -763,6 +777,90 @@ def run_claude(prompt: str, model: str, engine: bool = False, overrides: dict | 
         return {"text": fallback, "usage": _zero_usage(), "error": ""}
     msg = "claude returned no output"
     return {"text": f"[claude-code-cli error] {msg}", "usage": _zero_usage(), "error": msg}
+
+
+# --------------------------------------------------------------------------- #
+# Served-model provenance
+# --------------------------------------------------------------------------- #
+# The shim used to echo the *requested* model string straight back in the
+# OpenAI `model` response field. That is a provenance hole: the Claude CLI can
+# accept an unknown `--model` and quietly serve its default, and the caller has
+# no way to tell. Any policy that depends on "which model wrote this" was
+# trusting a label the shim invented rather than anything the CLI reported.
+#
+# The CLI's JSON envelope carries `modelUsage`, keyed by the model id actually
+# billed. That is ground truth, so surface it instead of the request string.
+
+_MODEL_FAMILIES = ("opus", "sonnet", "haiku", "fable")
+
+
+def _strict_model_enabled() -> bool:
+    return _env("CLAUDE_CODE_CLI_STRICT_MODEL", "1").strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+
+
+def _extract_served_model(parsed, requested: str = "") -> str:
+    """Return the billed model matching the requested family when available.
+
+    Claude Code may bill more than one model in one run (for example an
+    auxiliary Haiku plus the requested Opus). Taking the first `modelUsage` key
+    creates a false substitution alarm. Prefer a key in the requested family;
+    only fall back to the first billed model when that family is absent.
+    """
+    if not isinstance(parsed, dict):
+        return ""
+    usage = parsed.get("modelUsage")
+    if isinstance(usage, dict):
+        models = [key.strip() for key in usage if isinstance(key, str) and key.strip()]
+        want = _model_family(requested)
+        if want:
+            for model in models:
+                if _model_family(model) == want:
+                    return model
+        if models:
+            return models[0]
+    for key in ("model", "modelId"):
+        value = parsed.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    message = parsed.get("message")
+    if isinstance(message, dict):
+        value = message.get("model")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _model_family(name: str) -> str:
+    low = (name or "").lower()
+    for family in _MODEL_FAMILIES:
+        if family in low:
+            return family
+    return ""
+
+
+def check_model_provenance(requested: str, served: str) -> str:
+    """Return an error string when the CLI silently served a different family.
+
+    Empty string means no detectable substitution. Compare *families*, not exact
+    ids: legitimate aliases exist -- `opus` resolves to `claude-opus-5-<date>`,
+    and that is not a substitution. A request for `claude-fable-5` answered by
+    `claude-opus-5-...` is, and it must not be reported as Fable.
+
+    The message is prefixed `model not found:` so classify_cli_error() maps it
+    to a 404 and Hermes' failover chain engages, rather than the caller silently
+    receiving copy from a model it did not ask for.
+    """
+    if not _strict_model_enabled():
+        return ""
+    want, got = _model_family(requested), _model_family(served)
+    if not want or not got or want == got:
+        return ""
+    return (
+        f"model not found: requested {requested!r} but the Claude CLI served "
+        f"{served!r}; the requested model is unavailable on this account"
+    )
 
 
 def _zero_usage() -> dict:
@@ -978,6 +1076,7 @@ def stream_claude(prompt: str, model: str, engine: bool = False,
     result_usage = _zero_usage()
     result_error = ""
     saw_result = False
+    served_model = ""
 
     try:
         for event in iter_stream_json(proc.stdout or ()):  # watchdog kills on timeout
@@ -989,6 +1088,7 @@ def stream_claude(prompt: str, model: str, engine: bool = False,
                     emitted_parts.append(delta)
                     yield ("delta", delta)
             elif etype == "assistant":
+                served_model = _extract_served_model(event, model) or served_model
                 assistant_text = _extract_assistant_message_text(event)
                 if assistant_text and not emitted_any:
                     # No partial deltas (older CLI / flag off): emit the whole
@@ -997,6 +1097,7 @@ def stream_claude(prompt: str, model: str, engine: bool = False,
                     emitted_parts.append(assistant_text)
                     yield ("delta", assistant_text)
             else:
+                served_model = _extract_served_model(event, model) or served_model
                 parsed = _extract_result_event(event)
                 if parsed is not None:
                     result_text, result_usage, result_error = parsed
@@ -1049,7 +1150,22 @@ def stream_claude(prompt: str, model: str, engine: bool = False,
         yield ("final", {"text": err_line, "usage": _zero_usage(), "error": msg})
         return
 
-    yield ("final", {"text": final_text, "usage": result_usage, "error": ""})
+    substitution = check_model_provenance(model, served_model)
+    if substitution:
+        yield ("final", {
+            "text": f"[claude-code-cli error] {substitution}",
+            "usage": result_usage,
+            "error": substitution,
+            "model": served_model,
+        })
+        return
+
+    yield ("final", {
+        "text": final_text,
+        "usage": result_usage,
+        "error": "",
+        "model": served_model,
+    })
 
 
 # --------------------------------------------------------------------------- #
@@ -1220,7 +1336,8 @@ def classify_cli_error(msg: str) -> tuple:
     raw = (msg or "").strip() or "claude-code-cli failed"
     low = raw.lower()
     if any(p in low for p in _CLI_MODEL_PATTERNS):
-        return 404, "model_not_found", "model not found: " + raw
+        normalized = raw if low.startswith("model not found:") else f"model not found: {raw}"
+        return 404, "model_not_found", normalized
     if any(p in low for p in _CLI_AUTH_PATTERNS):
         return 401, "authentication_error", raw
     if any(p in low for p in _CLI_RATE_PATTERNS):
@@ -1345,27 +1462,32 @@ class Handler(BaseHTTPRequestHandler):
                 if outcome["error"]:
                     self._send_cli_failure(outcome["error"])
                 else:
+                    # Report the model the CLI actually billed, not the string
+                    # the caller asked for. Provenance must survive aliasing.
+                    served = outcome.get("model") or model
                     tool_calls = extract_native_tool_calls(outcome["text"], tools)
                     if tool_calls:
                         if stream:
-                            self._stream_tool_call_response(model, tool_calls, outcome["usage"], include_usage)
+                            self._stream_tool_call_response(served, tool_calls, outcome["usage"], include_usage)
                         else:
-                            self._send_json(200, build_tool_call_completion(model, tool_calls, outcome["usage"]))
+                            self._send_json(200, build_tool_call_completion(served, tool_calls, outcome["usage"]))
                     else:
                         if stream:
-                            self._stream_response(model, outcome, include_usage)
+                            self._stream_response(served, outcome, include_usage)
                         else:
-                            self._send_json(200, build_completion(model, outcome["text"], outcome["usage"]))
+                            self._send_json(200, build_completion(served, outcome["text"], outcome["usage"]))
             elif stream and _real_streaming_enabled():
                 outcome = self._stream_live_response(model, prompt, engine, overrides, include_usage)
             else:
                 outcome = run_claude(prompt, model, engine, overrides)
                 if outcome["error"]:
                     self._send_cli_failure(outcome["error"])
-                elif stream:
-                    self._stream_response(model, outcome, include_usage)
                 else:
-                    self._send_json(200, build_completion(model, outcome["text"], outcome["usage"]))
+                    served = outcome.get("model") or model
+                    if stream:
+                        self._stream_response(served, outcome, include_usage)
+                    else:
+                        self._send_json(200, build_completion(served, outcome["text"], outcome["usage"]))
 
             self.log_message(
                 "model=%s engine=%s native_tools=%s stream=%s live_stream=%s images=%s effort=%s %.1fs %s",
