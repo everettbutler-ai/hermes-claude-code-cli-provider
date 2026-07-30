@@ -151,6 +151,72 @@ sys.exit(42)
         self.assertIn("boom from fake claude", outcome["text"])
         self.assertEqual(outcome["usage"], server._zero_usage())
 
+    def test_fable_streams_are_buffered_until_model_provenance_is_known(self):
+        self.assertTrue(server._requires_provenance_buffer("fable"))
+        self.assertTrue(server._requires_provenance_buffer("claude-fable-5"))
+        self.assertFalse(server._requires_provenance_buffer("claude-sonnet-4-6"))
+
+    def test_run_claude_retries_one_transient_fable_model_substitution(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            counter = root / "count"
+            fake = make_fake_claude(root, f"""#!/usr/bin/env python3
+import json, pathlib, sys
+counter = pathlib.Path({str(counter)!r})
+count = int(counter.read_text()) + 1 if counter.exists() else 1
+counter.write_text(str(count))
+sys.stdin.read()
+served = "claude-haiku-4-5-20251001" if count == 1 else "claude-fable-5"
+print(json.dumps({{
+    "result": "ok",
+    "usage": {{}},
+    "modelUsage": {{served: {{"canonicalModel": served}}}},
+}}))
+""")
+            with temporary_env(
+                CLAUDE_CODE_CLI_BIN=str(fake),
+                CLAUDE_CODE_CLI_TIMEOUT="5",
+                CLAUDE_CODE_CLI_FABLE_PROVENANCE_RETRIES="1",
+                CLAUDE_CODE_CLI_STRICT_MODEL="1",
+            ):
+                outcome = server.run_claude("hello", "fable", engine=False)
+                attempts = counter.read_text()
+
+        self.assertEqual(attempts, "2")
+        self.assertEqual(outcome["text"], "ok")
+        self.assertEqual(outcome["model"], "claude-fable-5")
+        self.assertEqual(outcome["error"], "")
+
+    def test_run_claude_stops_after_bounded_fable_provenance_retry(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            counter = root / "count"
+            fake = make_fake_claude(root, f"""#!/usr/bin/env python3
+import json, pathlib, sys
+counter = pathlib.Path({str(counter)!r})
+count = int(counter.read_text()) + 1 if counter.exists() else 1
+counter.write_text(str(count))
+sys.stdin.read()
+served = "claude-haiku-4-5-20251001"
+print(json.dumps({{
+    "result": "wrong model",
+    "usage": {{}},
+    "modelUsage": {{served: {{"canonicalModel": served}}}},
+}}))
+""")
+            with temporary_env(
+                CLAUDE_CODE_CLI_BIN=str(fake),
+                CLAUDE_CODE_CLI_TIMEOUT="5",
+                CLAUDE_CODE_CLI_FABLE_PROVENANCE_RETRIES="1",
+                CLAUDE_CODE_CLI_STRICT_MODEL="1",
+            ):
+                outcome = server.run_claude("hello", "fable", engine=False)
+                attempts = counter.read_text()
+
+        self.assertEqual(attempts, "2")
+        self.assertEqual(outcome["model"], "claude-haiku-4-5-20251001")
+        self.assertIn("model not found:", outcome["error"])
+
     def test_http_chat_completion_and_stream_work_with_fake_cli(self):
         with tempfile.TemporaryDirectory() as td:
             fake = make_fake_claude(pathlib.Path(td), """#!/usr/bin/env python3

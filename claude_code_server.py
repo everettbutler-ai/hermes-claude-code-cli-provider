@@ -718,7 +718,24 @@ def _extract_json_object(text: str) -> dict | None:
         return None
 
 
-def run_claude(prompt: str, model: str, engine: bool = False, overrides: dict | None = None) -> dict:
+def run_claude(prompt: str, model: str, engine: bool = False,
+               overrides: dict | None = None) -> dict:
+    retries = _fable_provenance_retries(model)
+    outcome: dict = {}
+    for attempt in range(retries + 1):
+        outcome = _run_claude_once(prompt, model, engine, overrides)
+        if not _is_fable_provenance_substitution(model, outcome):
+            return outcome
+        if attempt < retries:
+            sys.stderr.write(
+                "[claude-code-cli] transient Fable model substitution; "
+                f"retrying exact route ({attempt + 1}/{retries})\n"
+            )
+    return outcome
+
+
+def _run_claude_once(prompt: str, model: str, engine: bool = False,
+                     overrides: dict | None = None) -> dict:
     """Invoke `claude -p` and return {text, usage, error}.
 
     `usage` is {prompt_tokens, completion_tokens, total_tokens}. On any failure
@@ -881,6 +898,37 @@ def check_model_provenance(requested: str, served: str) -> str:
         f"model not found: requested {requested!r} but the Claude CLI served "
         f"{served!r}; the requested model is unavailable on this account"
     )
+
+
+def _fable_provenance_retries(model: str) -> int:
+    """Return the bounded retry count for a Fable request served by another family."""
+    if _model_family(model) != "fable" or not _strict_model_enabled():
+        return 0
+    raw = _env("CLAUDE_CODE_CLI_FABLE_PROVENANCE_RETRIES", "1").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 1
+    return max(0, min(value, 2))
+
+
+def _is_fable_provenance_substitution(model: str, outcome: dict) -> bool:
+    """True only for a strict Fable request that completed under another model family."""
+    if _model_family(model) != "fable" or not isinstance(outcome, dict):
+        return False
+    error = str(outcome.get("error") or "").lower()
+    served = str(outcome.get("model") or "")
+    return error.startswith("model not found:") and _model_family(served) not in {"", "fable"}
+
+
+def _requires_provenance_buffer(model: str) -> bool:
+    """Hold Fable output until terminal modelUsage proves the requested family ran.
+
+    A transient wrong-family completion cannot be retracted after SSE headers
+    and deltas are sent. Buffering Fable lets the bounded retry above discard
+    substituted output and return only a provenance-checked completion.
+    """
+    return _strict_model_enabled() and _model_family(model) == "fable"
 
 
 def _zero_usage() -> dict:
@@ -1497,7 +1545,7 @@ class Handler(BaseHTTPRequestHandler):
                             self._stream_response(served, outcome, include_usage)
                         else:
                             self._send_json(200, build_completion(served, outcome["text"], outcome["usage"]))
-            elif stream and _real_streaming_enabled():
+            elif stream and _real_streaming_enabled() and not _requires_provenance_buffer(model):
                 outcome = self._stream_live_response(model, prompt, engine, overrides, include_usage)
             else:
                 outcome = run_claude(prompt, model, engine, overrides)
@@ -1513,7 +1561,10 @@ class Handler(BaseHTTPRequestHandler):
             self.log_message(
                 "model=%s engine=%s native_tools=%s stream=%s live_stream=%s images=%s effort=%s %.1fs %s",
                 model, engine, native_tools, stream,
-                bool(stream and _real_streaming_enabled() and not native_tools), images.count,
+                bool(
+                    stream and _real_streaming_enabled() and not native_tools
+                    and not _requires_provenance_buffer(model)
+                ), images.count,
                 overrides.get("effort") or _env("CLAUDE_CODE_CLI_EFFORT", "high"),
                 time.time() - started, "error" if outcome["error"] else "ok",
             )
