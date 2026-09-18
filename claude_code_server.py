@@ -37,6 +37,10 @@ Configuration (environment variables)
     CLAUDE_CODE_CLI_MAX_TURNS      --max-turns          (default 12)
     CLAUDE_CODE_CLI_TIMEOUT        per-request seconds  (default 600)
     CLAUDE_CODE_CLI_EXTRA_ARGS     extra argv, shlex    (default unset)
+    CLAUDE_CODE_CLI_MCP            account MCP servers  (default off => isolate;
+                                   'account' inherits the login's claude.ai
+                                   connectors; any other value is a --mcp-config
+                                   path/JSON loaded with --strict-mcp-config)
     CLAUDE_CODE_CLI_STREAM         real token streaming (default 1; see #3)
     CLAUDE_CODE_CLI_NATIVE_TOOLS   emit OpenAI tool_calls (default on)
     CLAUDE_CODE_CLI_VISION         pass images to claude(default on;  see #4)
@@ -71,7 +75,15 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # Model ids the shim advertises and forwards verbatim to `claude --model`.
-ADVERTISED_MODELS = ("opus", "sonnet", "haiku", "fable")
+# Hermes validates `/model` switches against this listing (models_validate
+# live-listing branch), so the exact id Hermes is configured with must appear
+# here or every slash-command model check rejects it even though inference
+# works. `claude-fable-5-1` is the real Fable id the CLI resolves; keep it.
+ADVERTISED_MODELS = ("opus", "sonnet", "haiku", "fable", "claude-fable-5-1")
+
+# Inline `--mcp-config` payload that, combined with `--strict-mcp-config`,
+# makes the CLI load zero MCP servers regardless of what the account has.
+EMPTY_MCP_CONFIG = '{"mcpServers":{}}'
 
 # Model strings the CLI accepts syntactically but does NOT resolve to the model
 # they name -- it silently serves a fallback instead. `claude-fable-5` is the
@@ -632,6 +644,21 @@ def build_claude_argv(model: str, engine: bool, overrides: dict | None = None,
     argv += ["--no-session-persistence"]
 
     effort = str(overrides.get("effort") or _env("CLAUDE_CODE_CLI_EFFORT", "high")).strip()
+    # Claude CLI auto-loads every claude.ai MCP connector attached to the
+    # logged-in account (Gmail, Drive, Linear, Figma, ...) and injects all of
+    # their tool schemas into EVERY request. With a dozen connectors live that
+    # is ~250K tokens against a 200K window, so even a 5-token probe 503s with
+    # "Prompt is too long". Hermes supplies its own tools, so isolate the CLI
+    # from account MCP unless the operator opts in.
+    raw_mcp = _env("CLAUDE_CODE_CLI_MCP", "").strip()
+    mcp_mode = raw_mcp.lower()
+    if mcp_mode in {"", "0", "off", "false", "no", "none"}:
+        argv += ["--strict-mcp-config", "--mcp-config", EMPTY_MCP_CONFIG]
+    elif mcp_mode in {"1", "on", "true", "yes", "account", "inherit"}:
+        pass  # let the CLI load the account's connectors as it normally would
+    else:
+        argv += ["--strict-mcp-config", "--mcp-config", raw_mcp]
+
     if effort:
         argv += ["--effort", effort]
 

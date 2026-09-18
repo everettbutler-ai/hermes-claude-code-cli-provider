@@ -86,6 +86,28 @@ class ClaudeCodeServerUnitTests(unittest.TestCase):
         self.assertIn("--safe-mode", argv)
         self.assertIn("--debug-file", argv)
 
+    def test_build_claude_argv_isolates_account_mcp_by_default(self):
+        # Regression: account claude.ai connectors injected ~250K tokens of tool
+        # schemas into every request and 503'd a 5-token probe (prompt too long).
+        with temporary_env(CLAUDE_CODE_CLI_BIN="/tmp/fake-claude", CLAUDE_CODE_CLI_MCP=""):
+            text_argv = server.build_claude_argv("haiku", engine=False)
+            eng_argv = server.build_claude_argv("sonnet", engine=True)
+            stream_argv = server.build_claude_argv("haiku", engine=False, stream=True)
+        for argv in (text_argv, eng_argv, stream_argv):
+            self.assertIn("--strict-mcp-config", argv)
+            self.assertEqual(argv[argv.index("--mcp-config") + 1], server.EMPTY_MCP_CONFIG)
+
+    def test_build_claude_argv_mcp_knob_inherits_or_pins_config(self):
+        with temporary_env(CLAUDE_CODE_CLI_BIN="/tmp/fake-claude", CLAUDE_CODE_CLI_MCP="account"):
+            argv = server.build_claude_argv("haiku", engine=False)
+        self.assertNotIn("--strict-mcp-config", argv)
+        self.assertNotIn("--mcp-config", argv)
+
+        with temporary_env(CLAUDE_CODE_CLI_BIN="/tmp/fake-claude", CLAUDE_CODE_CLI_MCP="/tmp/mcp.json"):
+            argv = server.build_claude_argv("haiku", engine=False)
+        self.assertIn("--strict-mcp-config", argv)
+        self.assertEqual(argv[argv.index("--mcp-config") + 1], "/tmp/mcp.json")
+
     def test_build_claude_argv_engine_mode_uses_allowed_tools_and_cwd_knobs(self):
         with temporary_env(
             CLAUDE_CODE_CLI_BIN="/tmp/fake-claude",
