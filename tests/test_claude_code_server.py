@@ -323,6 +323,41 @@ print(json.dumps({"result": "hello from fake http", "usage": {"input_tokens": 1,
             httpd.server_close()
             thread.join(timeout=5)
 
+    def test_handler_requires_configured_bearer(self):
+        with temporary_env(CLAUDE_CODE_CLI_API_KEY="local-test-bearer"):
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base = f"http://127.0.0.1:{httpd.server_address[1]}"
+                payload = json.dumps({"model": "haiku", "messages": [{"role": "user", "content": "hi"}]}).encode("utf-8")
+                for headers in (
+                    {"Content-Type": "application/json"},
+                    {"Content-Type": "application/json", "Authorization": "Bearer wrong"},
+                ):
+                    req = request.Request(base + "/v1/chat/completions", data=payload, headers=headers, method="POST")
+                    with self.assertRaises(error.HTTPError) as cm:
+                        request.urlopen(req, timeout=5)
+                    self.assertEqual(cm.exception.code, 401)
+                    cm.exception.close()
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=5)
+
+
+class ModelListingTests(unittest.TestCase):
+    """GET /v1/models is what Hermes validates `/model` against."""
+
+    def test_advertised_ids_are_canonical_and_cover_exact_fable_id(self):
+        # Every advertised id must be one the CLI truly resolves (no phantom
+        # spelling that normalize_model rewrites) and map to a known family.
+        for model_id in server.ADVERTISED_MODELS:
+            self.assertEqual(server.normalize_model(model_id), model_id)
+            self.assertTrue(server._model_family(model_id), model_id)
+        # The exact Fable id Hermes configures must validate against the listing.
+        self.assertIn(server.normalize_model("claude-fable-5-1"), server.ADVERTISED_MODELS)
+
 
 class NativeToolCallTests(unittest.TestCase):
     """Hermes-native tool-call emulation: the shim emits OpenAI tool_calls."""

@@ -9,6 +9,16 @@
 # See README.md for all environment-variable overrides.
 set -euo pipefail
 
+ENV_FILE="${CLAUDE_CODE_CLI_ENV_FILE:-${HERMES_HOME:-$HOME/.hermes}/claude-code-cli-shim.env}"
+if [[ -f "$ENV_FILE" ]]; then
+  # launchd passes only the file path. Load the owner-only service settings here
+  # so the bridge and every Claude child use the isolated automation credential.
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 PYTHON="${PYTHON:-python3}"

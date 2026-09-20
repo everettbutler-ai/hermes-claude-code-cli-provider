@@ -40,7 +40,7 @@ claude_code_cli = ProviderProfile(
     # `anthropic` profile. These point only at this local-CLI provider.
     aliases=("claude-cli", "cc-cli", "claude-code-local"),
     api_mode="chat_completions",
-    display_name="Claude Code (local CLI)",
+    display_name="Claude · Personal",
     description=(
         "Local Claude Code CLI via on-device shim (claude -p) - chat, "
         "streaming, vision, Hermes tool calls, and explicit engine mode"

@@ -60,6 +60,7 @@ request omits it (see ``extract_overrides``):
 from __future__ import annotations
 
 import base64
+import hmac
 import json
 import os
 import pathlib
@@ -643,7 +644,6 @@ def build_claude_argv(model: str, engine: bool, overrides: dict | None = None,
         argv += ["--output-format", "json"]
     argv += ["--no-session-persistence"]
 
-    effort = str(overrides.get("effort") or _env("CLAUDE_CODE_CLI_EFFORT", "high")).strip()
     # Claude CLI auto-loads every claude.ai MCP connector attached to the
     # logged-in account (Gmail, Drive, Linear, Figma, ...) and injects all of
     # their tool schemas into EVERY request. With a dozen connectors live that
@@ -659,6 +659,7 @@ def build_claude_argv(model: str, engine: bool, overrides: dict | None = None,
     else:
         argv += ["--strict-mcp-config", "--mcp-config", raw_mcp]
 
+    effort = str(overrides.get("effort") or _env("CLAUDE_CODE_CLI_EFFORT", "high")).strip()
     if effort:
         argv += ["--effort", effort]
 
@@ -745,12 +746,64 @@ def _extract_json_object(text: str) -> dict | None:
         return None
 
 
-def run_claude(prompt: str, model: str, engine: bool = False,
-               overrides: dict | None = None) -> dict:
+_FABLE_EXHAUSTION_RE = re.compile(
+    r"(?:you(?:'|’)ve\s+reached\s+your\s+fable\s+limit|"
+    r"(?:fable\s+)?usage\s+(?:limit|quota)\s+(?:reached|exceeded|exhausted)|"
+    r"fable\s+(?:limit|quota)\s+(?:reached|exceeded|exhausted)|"
+    r"(?:usage\s+)?credits?\s+(?:are\s+)?(?:exhausted|depleted)|"
+    r"(?:out\s+of|no)\s+(?:remaining\s+)?usage\s+credits?)",
+    re.IGNORECASE,
+)
+
+
+def _is_fable_exhaustion(model: str, outcome: dict) -> bool:
+    error = outcome.get("error")
+    return (
+        str(_model_family(model)).casefold() == "fable"
+        and isinstance(error, str)
+        and bool(error.strip())
+        and bool(_FABLE_EXHAUSTION_RE.search(error))
+    )
+
+
+def _fable_fallback_env() -> dict | None:
+    raw = os.environ.get("CLAUDE_CODE_CLI_FABLE_FALLBACK_CONFIG_DIR", "").strip()
+    if not raw:
+        return None
+    try:
+        target = pathlib.Path(raw).expanduser()
+        if not target.is_dir():
+            return None
+        target = target.resolve()
+        base = build_subprocess_env()
+        current = pathlib.Path(
+            base.get("CLAUDE_CONFIG_DIR") or pathlib.Path.home() / ".claude"
+        ).expanduser().resolve()
+        if target == current:
+            return None
+    except (OSError, RuntimeError):
+        return None
+    fallback_env = dict(base)
+    fallback_env["CLAUDE_CONFIG_DIR"] = str(target)
+    for name in (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+    ):
+        fallback_env.pop(name, None)
+    return fallback_env
+
+
+def _run_claude_with_provenance(prompt: str, model: str, engine: bool,
+                                overrides: dict | None,
+                                subprocess_env: dict | None = None) -> dict:
     retries = _fable_provenance_retries(model)
     outcome: dict = {}
     for attempt in range(retries + 1):
-        outcome = _run_claude_once(prompt, model, engine, overrides)
+        outcome = _run_claude_once(
+            prompt, model, engine, overrides, subprocess_env=subprocess_env
+        )
         if not _is_fable_provenance_substitution(model, outcome):
             return outcome
         if attempt < retries:
@@ -761,8 +814,32 @@ def run_claude(prompt: str, model: str, engine: bool = False,
     return outcome
 
 
+def run_claude(prompt: str, model: str, engine: bool = False,
+               overrides: dict | None = None) -> dict:
+    outcome = _run_claude_with_provenance(prompt, model, engine, overrides)
+    if engine or not _is_fable_exhaustion(model, outcome):
+        return outcome
+    fallback_env = _fable_fallback_env()
+    if fallback_env is None:
+        return outcome
+    sys.stderr.write(
+        f"[claude-code-cli] account fallback requested_model={model} account=Hedra\n"
+    )
+    outcome = _run_claude_with_provenance(
+        prompt, model, engine, overrides, subprocess_env=fallback_env
+    )
+    outcome["account_source"] = "hedra"
+    outcome["account_fallback"] = True
+    sys.stderr.write(
+        f"[claude-code-cli] account fallback returned requested_model={model} "
+        f"account=Hedra success={not bool(outcome.get('error'))}\n"
+    )
+    return outcome
+
+
 def _run_claude_once(prompt: str, model: str, engine: bool = False,
-                     overrides: dict | None = None) -> dict:
+                     overrides: dict | None = None, *,
+                     subprocess_env: dict | None = None) -> dict:
     """Invoke `claude -p` and return {text, usage, error}.
 
     `usage` is {prompt_tokens, completion_tokens, total_tokens}. On any failure
@@ -777,6 +854,7 @@ def _run_claude_once(prompt: str, model: str, engine: bool = False,
     except ValueError:
         timeout = int(default_timeout)
     cwd = _engine_cwd() if engine else None
+    run_env = dict(subprocess_env) if subprocess_env is not None else build_subprocess_env()
 
     try:
         proc = subprocess.run(
@@ -788,7 +866,7 @@ def _run_claude_once(prompt: str, model: str, engine: bool = False,
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
-            env=build_subprocess_env(),
+            env=run_env,
             cwd=cwd,
             check=False,
         )
@@ -1475,6 +1553,18 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # quieter, single-line logs to stderr
         sys.stderr.write("[claude-code-cli] " + (fmt % args) + "\n")
 
+    def _authorized(self) -> bool:
+        """Require the configured localhost bearer for inference requests."""
+        expected = _env("CLAUDE_CODE_CLI_API_KEY").strip()
+        if not expected:
+            return True
+        value = (self.headers.get("Authorization") or "").strip()
+        token = value[7:].strip() if value.lower().startswith("bearer ") else ""
+        if not token or not hmac.compare_digest(token, expected):
+            self._send_error(401, "invalid or missing bearer token", "authentication_error")
+            return False
+        return True
+
     # ---- routing ----
     def do_GET(self):
         path = self.path.split("?", 1)[0].rstrip("/")
@@ -1496,6 +1586,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0].rstrip("/")
         if path != "/v1/chat/completions":
             self._send_error(404, f"unknown path: {self.path}", "not_found")
+            return
+        if not self._authorized():
             return
 
         try:
