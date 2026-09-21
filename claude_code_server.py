@@ -746,55 +746,6 @@ def _extract_json_object(text: str) -> dict | None:
         return None
 
 
-_FABLE_EXHAUSTION_RE = re.compile(
-    r"(?:you(?:'|’)ve\s+reached\s+your\s+fable\s+limit|"
-    r"(?:fable\s+)?usage\s+(?:limit|quota)\s+(?:reached|exceeded|exhausted)|"
-    r"fable\s+(?:limit|quota)\s+(?:reached|exceeded|exhausted)|"
-    r"(?:usage\s+)?credits?\s+(?:are\s+)?(?:exhausted|depleted)|"
-    r"(?:out\s+of|no)\s+(?:remaining\s+)?usage\s+credits?)",
-    re.IGNORECASE,
-)
-
-
-def _is_fable_exhaustion(model: str, outcome: dict) -> bool:
-    error = outcome.get("error")
-    return (
-        str(_model_family(model)).casefold() == "fable"
-        and isinstance(error, str)
-        and bool(error.strip())
-        and bool(_FABLE_EXHAUSTION_RE.search(error))
-    )
-
-
-def _fable_fallback_env() -> dict | None:
-    raw = os.environ.get("CLAUDE_CODE_CLI_FABLE_FALLBACK_CONFIG_DIR", "").strip()
-    if not raw:
-        return None
-    try:
-        target = pathlib.Path(raw).expanduser()
-        if not target.is_dir():
-            return None
-        target = target.resolve()
-        base = build_subprocess_env()
-        current = pathlib.Path(
-            base.get("CLAUDE_CONFIG_DIR") or pathlib.Path.home() / ".claude"
-        ).expanduser().resolve()
-        if target == current:
-            return None
-    except (OSError, RuntimeError):
-        return None
-    fallback_env = dict(base)
-    fallback_env["CLAUDE_CONFIG_DIR"] = str(target)
-    for name in (
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        "ANTHROPIC_BASE_URL",
-    ):
-        fallback_env.pop(name, None)
-    return fallback_env
-
-
 def _run_claude_with_provenance(prompt: str, model: str, engine: bool,
                                 overrides: dict | None,
                                 subprocess_env: dict | None = None) -> dict:
@@ -816,25 +767,15 @@ def _run_claude_with_provenance(prompt: str, model: str, engine: bool,
 
 def run_claude(prompt: str, model: str, engine: bool = False,
                overrides: dict | None = None) -> dict:
-    outcome = _run_claude_with_provenance(prompt, model, engine, overrides)
-    if engine or not _is_fable_exhaustion(model, outcome):
-        return outcome
-    fallback_env = _fable_fallback_env()
-    if fallback_env is None:
-        return outcome
-    sys.stderr.write(
-        f"[claude-code-cli] account fallback requested_model={model} account=Hedra\n"
-    )
-    outcome = _run_claude_with_provenance(
-        prompt, model, engine, overrides, subprocess_env=fallback_env
-    )
-    outcome["account_source"] = "hedra"
-    outcome["account_fallback"] = True
-    sys.stderr.write(
-        f"[claude-code-cli] account fallback returned requested_model={model} "
-        f"account=Hedra success={not bool(outcome.get('error'))}\n"
-    )
-    return outcome
+    """Run one request. Account selection is NOT done here.
+
+    An exhausted account used to be replayed against a second CLAUDE_CONFIG_DIR
+    from inside this process. That hid the account switch from Hermes' session
+    provenance and cost one extra OAuth login per shim wanting the fallback.
+    Exhaustion now surfaces as a classified error and Hermes' own
+    fallback_providers chain picks the next route.
+    """
+    return _run_claude_with_provenance(prompt, model, engine, overrides)
 
 
 def _run_claude_once(prompt: str, model: str, engine: bool = False,
@@ -1497,6 +1438,27 @@ _CLI_RATE_PATTERNS = (
 )
 
 
+# An exhausted account is deterministic for this route: no amount of retrying
+# refills the bucket, and the only real recovery is a different account. Hermes
+# maps a bare 429 to FailoverReason.rate_limit (retryable -- burns the whole
+# backoff budget before cascading) and a 503 to FailoverReason.overloaded
+# (carries no should_fallback at all). Prefixing with a phrase from Hermes'
+# _BILLING_PATTERNS lands it on the billing verdict instead: retryable=False,
+# should_fallback=True, immediate cascade to the next fallback_providers entry.
+_CLI_EXHAUSTION_PREFIX = "credits exhausted: "
+
+_CLI_EXHAUSTION_PATTERNS = (
+    "manage usage credits",
+    "usage limit reached",
+    "usage limit exceeded",
+    "session limit",
+    "fable limit",
+    "credit balance",
+    "insufficient credits",
+    "out of usage credits",
+)
+
+
 def classify_cli_error(msg: str) -> tuple:
     """Map a claude-code-cli failure string to (status, error_type, message).
 
@@ -1513,6 +1475,12 @@ def classify_cli_error(msg: str) -> tuple:
         return 404, "model_not_found", normalized
     if any(p in low for p in _CLI_AUTH_PATTERNS):
         return 401, "authentication_error", raw
+    if low.startswith(_CLI_EXHAUSTION_PREFIX):
+        return 429, "rate_limit_error", raw
+    if any(p in low for p in _CLI_EXHAUSTION_PATTERNS):
+        # Keep the CLI's own wording after the prefix: the operator reading the
+        # log still needs to know WHICH limit was hit and when it resets.
+        return 429, "rate_limit_error", f"{_CLI_EXHAUSTION_PREFIX}{raw}"
     if any(p in low for p in _CLI_RATE_PATTERNS):
         return 429, "rate_limit_error", raw
     # Timeouts, missing binary, non-zero exit, empty output: the backend is
