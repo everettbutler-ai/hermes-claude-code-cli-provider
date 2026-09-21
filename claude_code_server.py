@@ -481,6 +481,11 @@ def extract_native_tool_calls(text: str, tools: list[dict]) -> list[dict]:
     """Extract OpenAI-shaped tool calls from Claude's strict JSON envelope."""
     parsed = _extract_json_object(text)
     if not isinstance(parsed, dict):
+        # A malformed transport envelope is not a user-facing answer. Do not
+        # guess/repair executable arguments; let the client retry or fail over.
+        if re.match(r'^\s*(?:```(?:json)?\s*)?\{\s*"tool_calls?"\s*:',
+                    text or "", flags=re.IGNORECASE):
+            raise ValueError("invalid tool-call envelope: malformed JSON")
         return []
     raw_calls = parsed.get("tool_calls")
     if raw_calls is None and "tool_call" in parsed:
@@ -1621,7 +1626,11 @@ class Handler(BaseHTTPRequestHandler):
                     # Report the model the CLI actually billed, not the string
                     # the caller asked for. Provenance must survive aliasing.
                     served = outcome.get("model") or model
-                    tool_calls = extract_native_tool_calls(outcome["text"], tools)
+                    try:
+                        tool_calls = extract_native_tool_calls(outcome["text"], tools)
+                    except ValueError as exc:
+                        self._send_cli_failure(str(exc))
+                        return
                     if tool_calls:
                         if stream:
                             self._stream_tool_call_response(served, tool_calls, outcome["usage"], include_usage)
