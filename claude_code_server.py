@@ -67,6 +67,7 @@ import pathlib
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -79,8 +80,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # Hermes validates `/model` switches against this listing (models_validate
 # live-listing branch), so the exact id Hermes is configured with must appear
 # here or every slash-command model check rejects it even though inference
-# works. `claude-fable-5-1` is the real Fable id the CLI resolves; keep it.
-ADVERTISED_MODELS = ("opus", "sonnet", "haiku", "fable", "claude-fable-5-1")
+# works. `claude-fable-5-2` is the current Fable id (needs Claude Code >= 2.1.290);
+# `claude-fable-5-1` stays advertised so older pinned jobs and rollback still validate.
+ADVERTISED_MODELS = ('opus', 'sonnet', 'haiku', 'fable', 'claude-fable-5-2', 'claude-fable-5-1', 'claude-sonnet-5-5', 'claude-opus-5-5')
 
 # Inline `--mcp-config` payload that, combined with `--strict-mcp-config`,
 # makes the CLI load zero MCP servers regardless of what the account has.
@@ -329,7 +331,8 @@ def _content_to_text(content, images: _ImageCollector | None = None) -> str:
     return str(content)
 
 
-def flatten_messages(messages: list[dict], images: _ImageCollector | None = None) -> str:
+def flatten_messages(messages: list[dict], images: _ImageCollector | None = None,
+                     native_tools: bool = False) -> str:
     """Render an OpenAI message list into a single prompt for `claude -p`.
 
     System/developer messages become a leading SYSTEM block; the conversation
@@ -356,6 +359,9 @@ def flatten_messages(messages: list[dict], images: _ImageCollector | None = None
                     (tc.get("function") or {}).get("name", "tool")
                     for tc in tool_calls if isinstance(tc, dict)
                 ]
+                if native_tools:
+                    names = [n if n.startswith('mcp__hermes__') else 'mcp__hermes__' + n
+                             for n in names if isinstance(n, str) and n]
                 call_desc = f" [requested tools: {', '.join(n for n in names if n)}]"
             convo.append(f"ASSISTANT: {text}{call_desc}".rstrip())
         elif role == "tool":
@@ -368,10 +374,23 @@ def flatten_messages(messages: list[dict], images: _ImageCollector | None = None
         parts.append("SYSTEM INSTRUCTIONS:\n" + "\n\n".join(system_blocks))
     if convo:
         parts.append("CONVERSATION:\n" + "\n\n".join(convo))
-    parts.append(
-        "Respond as the assistant to the latest user turn. "
-        "Return only the response text."
-    )
+    if native_tools:
+        parts.append(
+            "Respond as the assistant to the latest user turn. Tools available for this "
+            "request are provided via MCP. When you select one, Hermes executes it outside "
+            "this CLI turn and supplies its real result in a subsequent conversation turn; "
+            "do not simulate execution. After a tool result, continue any pending work using "
+            "the provided tools when needed. Give a final answer only when the work is done "
+            "or genuinely blocked. Do not infer a per-turn tool cap or ask the user to restart "
+            "already-approved work. Actual callable tool names start with mcp__hermes__; "
+            "use the exact listed names and argument types, not bare labels from conversation history. "
+            "Ordinary responses that need no tool can be answered normally."
+        )
+    else:
+        parts.append(
+            "Respond as the assistant to the latest user turn. "
+            "Return only the response text."
+        )
     return "\n\n".join(parts).strip()
 
 
@@ -655,9 +674,13 @@ def build_claude_argv(model: str, engine: bool, overrides: dict | None = None,
     # is ~250K tokens against a 200K window, so even a 5-token probe 503s with
     # "Prompt is too long". Hermes supplies its own tools, so isolate the CLI
     # from account MCP unless the operator opts in.
-    raw_mcp = _env("CLAUDE_CODE_CLI_MCP", "").strip()
+    raw_mcp = str(overrides.get("_mcp_config") or _env("CLAUDE_CODE_CLI_MCP", "")).strip()
     mcp_mode = raw_mcp.lower()
-    if mcp_mode in {"", "0", "off", "false", "no", "none"}:
+    if overrides.get("_mcp_config"):
+        # Internal per-request bridge config. This key is never accepted from an
+        # OpenAI request body; only run_claude_mcp_bridge sets it.
+        argv += ["--strict-mcp-config", "--mcp-config", raw_mcp]
+    elif mcp_mode in {"", "0", "off", "false", "no", "none"}:
         argv += ["--strict-mcp-config", "--mcp-config", EMPTY_MCP_CONFIG]
     elif mcp_mode in {"1", "on", "true", "yes", "account", "inherit"}:
         pass  # let the CLI load the account's connectors as it normally would
@@ -700,6 +723,9 @@ def build_claude_argv(model: str, engine: bool, overrides: dict | None = None,
         # Disable the CLI's own tool loop so it behaves as a pure text model
         # (Hermes auxiliary tasks: title-gen, compression, etc.).
         argv += ["--tools", _env("CLAUDE_CODE_CLI_TOOLS", "")]
+        allowed_mcp_tools = str(overrides.get("_allowed_mcp_tools") or "").strip()
+        if allowed_mcp_tools:
+            argv += ["--allowedTools", allowed_mcp_tools]
         disallowed = str(
             overrides.get("disallowed_tools")
             or _env("CLAUDE_CODE_CLI_DISALLOWED_TOOLS", "")
@@ -749,6 +775,357 @@ def _extract_json_object(text: str) -> dict | None:
         return parsed if isinstance(parsed, dict) else None
     except json.JSONDecodeError:
         return None
+
+
+# --------------------------------------------------------------------------- #
+# Structured MCP bridge for Hermes-owned tools
+# --------------------------------------------------------------------------- #
+def _mcp_tool_specs(tools: list[dict]) -> list[dict]:
+    specs: list[dict] = []
+    for item in tools:
+        fn = item.get("function") if isinstance(item, dict) else None
+        if not isinstance(fn, dict):
+            raise ValueError("invalid function tool specification")
+        name = fn.get("name")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", name):
+            raise ValueError("invalid tool name")
+        if any(spec["name"] == name for spec in specs):
+            raise ValueError("duplicate tool name")
+        schema = fn.get("parameters", {"type": "object"})
+        if not isinstance(schema, (dict, bool)):
+            raise ValueError("invalid tool parameter schema")
+        specs.append({
+            "name": name,
+            "description": str(fn.get("description") or ""),
+            "inputSchema": schema,
+        })
+    return specs
+
+
+def _write_private_json(path: pathlib.Path, value: dict) -> None:
+    path.write_text(json.dumps(value, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    path.chmod(0o600)
+
+
+def _run_mcp_cli(prompt: str, model: str, config_path: pathlib.Path,
+                 allowed_tools: str, overrides: dict | None = None) -> dict:
+    """Run one bounded CLI turn and collect stream-json without leaking children."""
+    internal = dict(overrides or {})
+    internal.update({
+        "_mcp_config": str(config_path),
+        "_allowed_mcp_tools": allowed_tools,
+        "max_turns": "1",
+    })
+    argv = build_claude_argv(model, engine=False, overrides=internal, stream=True)
+    try:
+        timeout = int(_env("CLAUDE_CODE_CLI_TIMEOUT", "600"))
+    except ValueError:
+        timeout = 600
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=build_subprocess_env(),
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        return {"events": [], "returncode": 127, "stderr": "claude binary not found", "timed_out": False}
+    except Exception as exc:
+        return {"events": [], "returncode": 126, "stderr": f"claude invocation failed: {exc!r}", "timed_out": False}
+    timed_out = False
+    try:
+        stdout, stderr = proc.communicate(prompt, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+        stdout, stderr = proc.communicate()
+    events = list(iter_stream_json((stdout or "").splitlines()))
+    return {
+        "events": events,
+        "returncode": proc.returncode,
+        "stderr": (stderr or "")[-2000:],
+        "timed_out": timed_out,
+    }
+
+
+def _read_bridge_events(path: pathlib.Path, *, request_id: str) -> list[dict]:
+    if not path.exists():
+        return []
+    records: list[dict] = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            value = json.loads(line)
+            if isinstance(value, dict) and value.get("request_id") == request_id:
+                records.append(value)
+    except (OSError, json.JSONDecodeError):
+        return []
+    return records
+
+
+def _assistant_tool_uses(events: list[dict]) -> list[dict]:
+    calls: list[dict] = []
+    for event in events:
+        if event.get("type") != "assistant":
+            continue
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                calls.append(block)
+    return calls
+
+
+def _recover_unprefixed_capture(events: list[dict], result: dict, model: str,
+                                specs: list[dict], captured: list[dict],
+                                spec_path: pathlib.Path, events_path: pathlib.Path,
+                                bridge_script: pathlib.Path, request_id: str,
+                                invocation: dict) -> list[dict]:
+    """Capture only exact CLI-rejected bare calls; never execute Hermes tools."""
+    calls = _assistant_tool_uses(events)
+    if captured or not calls or invocation.get('timed_out'):
+        return captured
+    if invocation.get('returncode') != 0 and not (
+        invocation.get('returncode') == 1 and result.get('is_error') is True
+        and result.get('terminal_reason') == 'max_turns'
+    ):
+        return captured
+    if not result or result.get('permission_denials') or (
+        result.get('is_error') and result.get('terminal_reason') != 'max_turns'
+    ):
+        return captured
+    billed = result.get('modelUsage')
+    if not isinstance(billed, dict) or not billed or not _extract_served_model(result, model):
+        return captured
+    if check_model_provenance(model, _extract_served_model(result, model)):
+        return captured
+    allowed = {spec['name'] for spec in specs}
+    ids: set[str] = set()
+    for call in calls:
+        name, cid = call.get('name'), call.get('id')
+        if (not isinstance(name, str) or name not in allowed or
+            not isinstance(cid, str) or not cid.strip() or cid in ids or
+            not isinstance(call.get('input'), dict)):
+            return captured
+        ids.add(cid)
+    rejected: dict[str, list[str]] = {}
+    for event in events:
+        if event.get('type') != 'user':
+            continue
+        message = event.get('message')
+        content = message.get('content') if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get('type') != 'tool_result':
+                continue
+            cid = block.get('tool_use_id')
+            if not isinstance(cid, str) or cid not in ids or block.get('is_error') is not True:
+                return captured
+            text = block.get('content')
+            if isinstance(text, list) and len(text) == 1 and isinstance(text[0], dict):
+                text = text[0].get('text')
+            if not isinstance(text, str):
+                return captured
+            rejected.setdefault(cid, []).append(text)
+    for call in calls:
+        text = f"Error: No such tool available: {call['name']}"
+        actual = rejected.get(call['id'], [])
+        if len(actual) != 1 or actual[0] not in (text, f'<tool_use_error>{text}</tool_use_error>'):
+            return captured
+    requests = [json.dumps({
+        'jsonrpc': '2.0', 'id': index + 1, 'method': 'tools/call',
+        'params': {'name': call['name'], 'arguments': call['input'],
+                   '_meta': {'claudecode/toolUseId': call['id']}},
+    }, ensure_ascii=False) for index, call in enumerate(calls)]
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(bridge_script), str(spec_path), str(events_path)],
+            input='\n'.join(requests) + '\n', capture_output=True, text=True,
+            encoding='utf-8', timeout=10, check=False,
+        )
+        if proc.returncode != 0:
+            return captured
+        replies = [json.loads(line) for line in proc.stdout.splitlines()]
+        if (len(replies) != len(calls) or any(
+            not isinstance(reply, dict) or type(reply.get('id')) is not int or
+            reply['id'] != index + 1 or not isinstance(reply.get('result'), dict) or
+            type(reply['result'].get('isError')) is not bool
+            for index, reply in enumerate(replies)
+        )):
+            return captured
+    except (OSError, subprocess.TimeoutExpired, ValueError, TypeError):
+        return captured
+    records = _read_bridge_events(events_path, request_id=request_id)
+    if (len(records) != len(calls) or any(
+        record.get('status') not in ('accepted', 'rejected') or
+        record.get('name') != call['name'] or
+        record.get('arguments') != call['input'] or record.get('tool_use_id') != call['id'] or
+        reply['result']['isError'] is not (record['status'] == 'rejected')
+        for call, record, reply in zip(calls, records, replies)
+    )):
+        return captured
+    return records
+
+
+def _last_result_event(events: list[dict]) -> dict:
+    for event in reversed(events):
+        if event.get("type") == "result" or (
+            event.get("type") is None and isinstance(event.get("result"), str)
+        ):
+            return event
+    return {}
+
+
+def run_claude_mcp_bridge(prompt: str, model: str, tools: list[dict], tool_choice,
+                          overrides: dict | None = None) -> dict:
+    """Ask Claude to select Hermes tools through a request-scoped MCP server.
+
+    The MCP process advertises schemas and captures validated calls only. It
+    never executes a tool. This function cross-checks the capture against the
+    model's structured ``tool_use`` event before emitting OpenAI ``tool_calls``.
+    """
+    try:
+        specs = _mcp_tool_specs(tools)
+    except ValueError as exc:
+        return {"text": "", "usage": _zero_usage(), "error": str(exc),
+                "http_status": 400, "model": "", "tool_calls": []}
+    specific = _tool_choice_name(tool_choice)
+    if specific:
+        specs = [spec for spec in specs if spec["name"] == specific]
+        if not specs:
+            return {"text": "", "usage": _zero_usage(), "error": "unknown required tool",
+                    "http_status": 400, "model": "", "tool_calls": []}
+        prompt = prompt.rstrip() + f"\n\nYou must use the available Hermes tool {'mcp__hermes__' + specific!r} for this turn."
+    elif isinstance(tool_choice, str) and tool_choice.strip().lower() == "required":
+        prompt = prompt.rstrip() + "\n\nYou must use one of the available Hermes tools for this turn."
+    if not specs:
+        return {"text": "", "usage": _zero_usage(), "error": "no valid tool schemas",
+                "http_status": 400, "model": "", "tool_calls": []}
+
+    request_id = uuid.uuid4().hex
+    bridge_script = pathlib.Path(__file__).with_name("hermes_mcp_bridge.py")
+    with tempfile.TemporaryDirectory(prefix="claude-hermes-mcp-") as td:
+        root = pathlib.Path(td)
+        root.chmod(0o700)
+        spec_path = root / "tools.json"
+        events_path = root / "events.jsonl"
+        config_path = root / "mcp.json"
+        _write_private_json(spec_path, {"request_id": request_id, "tools": specs})
+        _write_private_json(config_path, {"mcpServers": {"hermes": {
+            "command": sys.executable,
+            "args": [str(bridge_script), str(spec_path), str(events_path)],
+        }}})
+        allowed = ",".join(f"mcp__hermes__{spec['name']}" for spec in specs)
+        invocation = _run_mcp_cli(prompt, model, config_path, allowed, overrides)
+        captured = _read_bridge_events(events_path, request_id=request_id)
+        raw = invocation.get('events')
+        if isinstance(raw, list):
+            captured = _recover_unprefixed_capture(
+                raw, _last_result_event(raw), model, specs, captured,
+                spec_path, events_path, bridge_script, request_id, invocation,
+            )
+
+    if invocation.get("timed_out"):
+        return {"text": "", "usage": _zero_usage(), "error": "claude MCP tool selection timed out",
+                "model": "", "tool_calls": []}
+    raw_events = invocation.get("events")
+    events: list[dict] = raw_events if isinstance(raw_events, list) else []
+    result = _last_result_event(events)
+    usage = _map_usage(result.get("usage"))
+    served = _extract_served_model(result, model)
+    substitution = check_model_provenance(model, served)
+    if substitution:
+        return {"text": "", "usage": usage, "error": substitution,
+                "model": served, "tool_calls": []}
+    # A bounded selection ends at max_turns after capture. Every other
+    # terminal failure must remain a failure, even if partial calls exist.
+    if result.get("is_error") and result.get("terminal_reason") != "max_turns":
+        message = str(result.get("result") or result.get("error") or invocation.get("stderr") or "claude reported is_error")
+        return {"text": "", "usage": usage, "error": message, "model": served, "tool_calls": []}
+    if not result or not served:
+        return {"text": "", "usage": usage, "error": "missing terminal result or billed model provenance",
+                "http_status": 503, "model": served, "tool_calls": []}
+    rejected = [record for record in captured if record.get("status") != "accepted"]
+    if rejected:
+        detail = str(rejected[0].get("error") or "invalid tool request")
+        return {"text": "", "usage": usage, "error": detail,
+                "http_status": 503, "model": served, "tool_calls": []}
+
+    model_calls = _assistant_tool_uses(events)
+    if model_calls:
+        if len(model_calls) != len(captured):
+            allowed_names = {spec["name"] for spec in specs}
+            def safe_name(value):
+                name = value if isinstance(value, str) else ""
+                if name.startswith("mcp__hermes__"):
+                    name = name[len("mcp__hermes__"):]
+                return name if name in allowed_names else "<unknown>"
+            detail = {
+                "model_calls": len(model_calls), "captured": len(captured),
+                "model_tool_names": [safe_name(block.get("name")) for block in model_calls],
+                "captured_tool_names": [safe_name(record.get("name")) for record in captured],
+                "permission_denials": len(result.get("permission_denials") or []),
+            }
+            return {"text": "", "usage": usage, "error": "bridge capture mismatch: call count; " + json.dumps(detail),
+                    "http_status": 503, "model": served, "tool_calls": []}
+        openai_calls: list[dict] = []
+        for block, record in zip(model_calls, captured):
+            model_name = str(block.get("name") or "")
+            raw_name = model_name[len("mcp__hermes__"):] if model_name.startswith("mcp__hermes__") else model_name
+            model_input = block.get("input")
+            call_id = str(block.get("id") or "")
+            if (
+                record.get("status") != "accepted"
+                or record.get("name") != raw_name
+                or record.get("arguments") != model_input
+                or (record.get("tool_use_id") and record.get("tool_use_id") != call_id)
+            ):
+                return {"text": "", "usage": usage, "error": "bridge capture mismatch: structured call differs",
+                        "http_status": 503, "model": served, "tool_calls": []}
+            openai_calls.append({
+                "id": call_id or "call_" + uuid.uuid4().hex,
+                "type": "function",
+                "function": {
+                    "name": raw_name,
+                    "arguments": json.dumps(model_input, ensure_ascii=False, separators=(",", ":")),
+                },
+            })
+        return {"text": "", "usage": usage, "error": "", "model": served,
+                "tool_calls": openai_calls}
+
+    text = ""
+    for event in reversed(events):
+        if event.get("type") == "assistant":
+            text = _extract_assistant_message_text(event)
+            if text:
+                break
+    if not text:
+        result_text = result.get("result")
+        text = result_text if isinstance(result_text, str) else ""
+    if re.search(r'"tool_calls"\s*:', text):
+        return {"text": "", "usage": usage, "error": "invalid tool-call envelope: text is not a structured MCP request",
+                "http_status": 503, "model": served, "tool_calls": []}
+    required = isinstance(tool_choice, str) and tool_choice.strip().lower() == "required"
+    if required or specific:
+        return {"text": "", "usage": usage, "error": "required tool was not selected",
+                "http_status": 400, "model": served, "tool_calls": []}
+    if result.get("is_error"):
+        message = text or str(result.get("error") or invocation.get("stderr") or "claude reported is_error")
+        return {"text": "", "usage": usage, "error": message, "model": served, "tool_calls": []}
+    if not text:
+        message = str(invocation.get("stderr") or "claude returned no output")
+        return {"text": "", "usage": usage, "error": message, "model": served, "tool_calls": []}
+    return {"text": text, "usage": usage, "error": "", "model": served, "tool_calls": []}
 
 
 def _run_claude_with_provenance(prompt: str, model: str, engine: bool,
@@ -987,16 +1364,8 @@ def _zero_usage() -> dict:
 
 
 def _map_usage(usage) -> dict:
-    if not isinstance(usage, dict):
-        return _zero_usage()
-    prompt = (
-        int(usage.get("input_tokens", 0) or 0)
-        + int(usage.get("cache_read_input_tokens", 0) or 0)
-        + int(usage.get("cache_creation_input_tokens", 0) or 0)
-    )
-    completion = int(usage.get("output_tokens", 0) or 0)
-    return {"prompt_tokens": prompt, "completion_tokens": completion,
-            "total_tokens": prompt + completion}
+    import efficiency_guard
+    return efficiency_guard.map_claude_usage(usage)
 
 
 # --------------------------------------------------------------------------- #
@@ -1456,6 +1825,8 @@ _CLI_EXHAUSTION_PATTERNS = (
     "manage usage credits",
     "usage limit reached",
     "usage limit exceeded",
+    "weekly limit",
+    "weekly usage limit",
     "session limit",
     "fable limit",
     "credit balance",
@@ -1581,7 +1952,18 @@ class Handler(BaseHTTPRequestHandler):
         stream = bool(body.get("stream"))
         include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
 
-        tools = _openai_tool_defs(body.get("tools"))
+        raw_tools = body.get("tools")
+        if raw_tools:
+            if not isinstance(raw_tools, list):
+                self._send_error(400, "tools must be an array", "invalid_request_error")
+                return
+            try:
+                _mcp_tool_specs([item if isinstance(item, dict) and "function" in item
+                                 else {"function": item} for item in raw_tools])
+            except ValueError as exc:
+                self._send_error(400, str(exc), "invalid_request_error")
+                return
+        tools = _openai_tool_defs(raw_tools)
         tool_choice = body.get("tool_choice", "auto")
 
         # Engine mode: let Claude Code use its own tools to do real work, but
@@ -1601,7 +1983,7 @@ class Handler(BaseHTTPRequestHandler):
 
         images = _ImageCollector()
         try:
-            prompt = flatten_messages(messages, images)
+            prompt = flatten_messages(messages, images, native_tools=native_tools)
             if engine:
                 prompt += (
                     "\n\nYou are operating as an autonomous coding engine with your own tools "
@@ -1609,28 +1991,29 @@ class Handler(BaseHTTPRequestHandler):
                     "them to actually carry out the task - read/modify files, run commands - then "
                     "report what you did. Do not ask for permission; act."
                 )
-            elif native_tools:
-                prompt = build_native_tool_prompt(prompt, tools, tool_choice)
             overrides = extract_overrides(body)
             started = time.time()
 
             if native_tools:
-                # Native tool-call emulation must inspect Claude's final JSON
-                # envelope before responding, so buffer the CLI call. For
-                # stream:true clients, emit standard OpenAI tool-call SSE chunks
-                # after parsing instead of token text deltas.
-                outcome = run_claude(prompt, model, engine=False, overrides=overrides)
+                # Advertise Hermes-owned tools through a request-scoped MCP
+                # server. The server captures validated selections but never
+                # executes them; Hermes receives ordinary OpenAI tool_calls and
+                # retains its normal approval and execution boundary.
+                outcome = run_claude_mcp_bridge(
+                    prompt, model, tools, tool_choice, overrides=overrides
+                )
                 if outcome["error"]:
-                    self._send_cli_failure(outcome["error"])
+                    if outcome.get("http_status"):
+                        self._send_error(
+                            int(outcome["http_status"]), outcome["error"],
+                            "invalid_request_error" if int(outcome["http_status"]) < 500
+                            else "service_unavailable",
+                        )
+                    else:
+                        self._send_cli_failure(outcome["error"])
                 else:
-                    # Report the model the CLI actually billed, not the string
-                    # the caller asked for. Provenance must survive aliasing.
                     served = outcome.get("model") or model
-                    try:
-                        tool_calls = extract_native_tool_calls(outcome["text"], tools)
-                    except ValueError as exc:
-                        self._send_cli_failure(str(exc))
-                        return
+                    tool_calls = outcome.get("tool_calls") or []
                     if tool_calls:
                         if stream:
                             self._stream_tool_call_response(served, tool_calls, outcome["usage"], include_usage)
@@ -1653,6 +2036,47 @@ class Handler(BaseHTTPRequestHandler):
                         self._stream_response(served, outcome, include_usage)
                     else:
                         self._send_json(200, build_completion(served, outcome["text"], outcome["usage"]))
+
+            try:
+                import efficiency_guard
+                _atlas_log = _env('CLAUDE_CODE_CLI_USAGE_LOG', '')
+                if isinstance(_atlas_log, str) and _atlas_log.strip():
+                    import uuid
+                    from datetime import datetime, timezone
+                    _atlas_metadata = body.get('metadata') if isinstance(body, dict) else None
+                    _atlas_session = _atlas_metadata.get('session_id') if isinstance(_atlas_metadata, dict) else None
+                    if not (isinstance(_atlas_session, str) and 0 < len(_atlas_session) <= 128 and _atlas_session.isprintable()):
+                        _atlas_session = 'unattributed'
+                    native_tool_count = len(tools) if isinstance(tools, (list, tuple)) else 0
+                    _atlas_model = outcome.get('model')
+                    if not (isinstance(_atlas_model, str) and 0 < len(_atlas_model) <= 128 and _atlas_model.isprintable()):
+                        _atlas_model = model if isinstance(model, str) and 0 < len(model) <= 128 and model.isprintable() else 'unknown'
+                    _atlas_port = int(_env('CLAUDE_CODE_CLI_PORT', '8765'))
+                    if not 1 <= _atlas_port <= 65535:
+                        raise ValueError
+                    _atlas_provider = {8765: 'Personal', 8767: 'Personal', 8768: 'Hedra', 8769: 'XBuild', 8770: 'Genesis'}.get(_atlas_port, 'claude-code-cli')
+                    efficiency_guard.append_request(_atlas_log, {
+                        'timestamp': time.time(),
+                        'request_id': uuid.uuid4().hex,
+                        'session_id': _atlas_session,
+                        'profile': 'default',
+                        'provider': _atlas_provider,
+                        'endpoint_port': _atlas_port,
+                        'model': _atlas_model,
+                        'task': 'shim',
+                        'prompt_chars': len(prompt) if isinstance(prompt, str) else 0,
+                        'tool_count': native_tool_count,
+                        'latency_seconds': max(0.0, time.time() - started),
+                        'usage': outcome.get('usage') or {},
+                        'status': 'error' if outcome.get('error') else 'ok',
+                        'retry_count': 0,
+                    })
+            except Exception:
+                try:
+                    import sys
+                    sys.stderr.write('Atlas efficiency telemetry unavailable.\n')
+                except Exception:
+                    pass
 
             self.log_message(
                 "model=%s engine=%s native_tools=%s stream=%s live_stream=%s images=%s effort=%s %.1fs %s",
@@ -1723,11 +2147,13 @@ class Handler(BaseHTTPRequestHandler):
 
         outcome = {"text": "", "usage": _zero_usage(), "error": "stream ended before final event"}
         headers_sent = False
+        prelude = ""
+        hold_limit = 128
 
         def open_stream() -> None:
-            # Deferred so a CLI failure that produces zero tokens can still be
-            # returned as a real HTTP error. Once the 200 status line is on the
-            # wire it cannot be taken back, and Hermes' failover never fires.
+            # Deferred so a CLI failure in the prelude can still be returned
+            # as an HTTP error. Once the 200 status line is on the wire it
+            # cannot be taken back, and Hermes' failover never fires.
             nonlocal headers_sent
             if headers_sent:
                 return
@@ -1742,17 +2168,37 @@ class Handler(BaseHTTPRequestHandler):
         try:
             for kind, payload in stream_claude(prompt, model, engine, overrides):
                 if kind == "delta":
-                    open_stream()
-                    self._write_sse(chunk({"content": payload}))
+                    if headers_sent:
+                        self._write_sse(chunk({"content": payload}))
+                        continue
+                    while payload and not headers_sent:
+                        room = hold_limit - len(prelude)
+                        prelude += payload[:room]
+                        payload = payload[room:]
+                        if len(prelude) == hold_limit:
+                            patterns = (_CLI_MODEL_PATTERNS + _CLI_AUTH_PATTERNS
+                                        + _CLI_RATE_PATTERNS + _CLI_EXHAUSTION_PATTERNS)
+                            if hold_limit == 128 and any(
+                                pattern in prelude.lower()
+                                for pattern in patterns
+                            ):
+                                hold_limit = 4096
+                            else:
+                                open_stream()
+                                self._write_sse(chunk({"content": prelude}))
+                                prelude = ""
+                    if headers_sent and payload:
+                        self._write_sse(chunk({"content": payload}))
                 elif kind == "final" and isinstance(payload, dict):
                     outcome = payload
                     break
             if outcome["error"] and not headers_sent:
-                # Auth expiry, usage limit, bad model, dead binary, timeout:
-                # nothing streamed, so surface a status Hermes can classify.
+                # Discard the held error text so Hermes can classify the HTTP failure.
                 self._send_cli_failure(outcome["error"])
                 return outcome
             open_stream()
+            if prelude:
+                self._write_sse(chunk({"content": prelude}))
             self._write_sse(chunk({}, finish="stop"))
             if include_usage:
                 self._write_sse({

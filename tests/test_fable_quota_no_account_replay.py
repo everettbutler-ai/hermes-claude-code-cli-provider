@@ -110,6 +110,16 @@ class ExhaustionClassificationTests(unittest.TestCase):
         self.assertIn("credits exhausted", msg.lower())
         self.assertIn("session limit", msg)
 
+    def test_weekly_limit_is_billing_class_429(self):
+        for text in (
+            "You've hit your weekly limit · resets Oct 1 at 5am (America/Los_Angeles)",
+            "You've hit your weekly usage limit",
+        ):
+            with self.subTest(text=text):
+                status, etype, message = S.classify_cli_error(text)
+                self.assertEqual((status, etype), (429, "rate_limit_error"))
+                self.assertEqual(message, "credits exhausted: " + text)
+
     def test_normalization_is_idempotent(self):
         once = S.classify_cli_error(FABLE_LIMIT)[2]
         twice = S.classify_cli_error(once)[2]

@@ -156,7 +156,7 @@ print(json.dumps({
                 outcome = server.run_claude("hello world", "haiku", engine=False)
 
         self.assertEqual(outcome["text"], "fake response to world")
-        self.assertEqual(outcome["usage"], {"prompt_tokens": 10, "completion_tokens": 7, "total_tokens": 17})
+        self.assertEqual(outcome["usage"], {"prompt_tokens": 10, "completion_tokens": 7, "total_tokens": 17, "prompt_tokens_details": {"cached_tokens": 3, "cache_write_tokens": 5}, "usage_available": True, "cache_read_input_tokens": 3, "cache_creation_input_tokens": 5})
         self.assertEqual(outcome["error"], "")
 
     def test_run_claude_surfaces_nonzero_exit_without_crashing(self):
@@ -390,16 +390,8 @@ class NativeToolCallTests(unittest.TestCase):
 
     def test_native_tool_call_response_shape_from_fake_cli_json(self):
         with tempfile.TemporaryDirectory() as td:
-            fake = make_fake_claude(pathlib.Path(td), """#!/usr/bin/env python3
-import json, sys
-prompt = sys.stdin.read()
-assert "Available Hermes-native tools" in prompt
-assert "skill_view" in prompt
-print(json.dumps({
-    "result": json.dumps({"tool_calls": [{"name": "skill_view", "arguments": {"name": "hermes-agent"}}]}),
-    "usage": {"input_tokens": 4, "output_tokens": 5},
-}))
-""")
+            from tests.mcp_fake import make
+            fake = make(pathlib.Path(td), 'hermes-agent', {'input_tokens': 4, 'output_tokens': 5})
             with temporary_env(CLAUDE_CODE_CLI_BIN=str(fake), CLAUDE_CODE_CLI_TIMEOUT="5"):
                 httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
                 thread = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -430,7 +422,7 @@ print(json.dumps({
             fake = make_fake_claude(pathlib.Path(td), """#!/usr/bin/env python3
 import json, sys
 sys.stdin.read()
-print(json.dumps({"result": "I can answer without a tool.", "usage": {"input_tokens": 1, "output_tokens": 2}}))
+print(json.dumps({"modelUsage": {"claude-haiku-4-5": {}}, "result": "I can answer without a tool.", "usage": {"input_tokens": 1, "output_tokens": 2}}))
 """)
             with temporary_env(CLAUDE_CODE_CLI_BIN=str(fake), CLAUDE_CODE_CLI_TIMEOUT="5"):
                 httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
@@ -451,14 +443,8 @@ print(json.dumps({"result": "I can answer without a tool.", "usage": {"input_tok
 
     def test_native_tool_call_stream_request_is_buffered_tool_call_response(self):
         with tempfile.TemporaryDirectory() as td:
-            fake = make_fake_claude(pathlib.Path(td), """#!/usr/bin/env python3
-import json, sys
-sys.stdin.read()
-print(json.dumps({
-    "result": json.dumps({"tool_calls": [{"name": "skill_view", "arguments": {"name": "debugging-workflows"}}]}),
-    "usage": {"input_tokens": 3, "output_tokens": 4},
-}))
-""")
+            from tests.mcp_fake import make
+            fake = make(pathlib.Path(td), 'debugging-workflows', {'input_tokens': 3, 'output_tokens': 4})
             with temporary_env(CLAUDE_CODE_CLI_BIN=str(fake), CLAUDE_CODE_CLI_TIMEOUT="5"):
                 httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
                 thread = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -899,7 +885,7 @@ emit({"type": "result", "result": "hello", "usage": {"input_tokens": 4, "output_
         self.assertEqual(len(finals), 1)
         final = finals[0]
         self.assertEqual(final["text"], "hello")
-        self.assertEqual(final["usage"], {"prompt_tokens": 4, "completion_tokens": 5, "total_tokens": 9})
+        self.assertEqual(final["usage"], {"prompt_tokens": 4, "completion_tokens": 5, "total_tokens": 9, "prompt_tokens_details": {}, "usage_available": True})
 
     def test_stream_claude_bare_json_result_falls_back_to_single_delta(self):
         with tempfile.TemporaryDirectory() as td:
@@ -959,9 +945,12 @@ emit({"type": "result", "result": "onetwo", "usage": {"input_tokens": 1, "output
                     httpd.shutdown()
                     httpd.server_close()
                     thread.join(timeout=5)
-        self.assertIn('"content": "one"', body)
-        self.assertIn('"content": "two"', body)
-        self.assertIn('"usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}', body)
+        chunks = [json.loads(line[6:]) for line in lines
+                  if line.startswith('data: {')]
+        text = ''.join(chunk['choices'][0]['delta'].get('content', '')
+                       for chunk in chunks if chunk.get('choices'))
+        self.assertEqual(text, 'onetwo')
+        self.assertIn('"usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3, "prompt_tokens_details": {}, "usage_available": true}', body)
         self.assertIn("data: [DONE]", body)
 
 

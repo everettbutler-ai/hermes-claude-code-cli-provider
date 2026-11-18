@@ -31,9 +31,10 @@ def test_http_rejects_malformed_envelope_before_success_headers(monkeypatch, str
     monkeypatch.setenv("CLAUDE_CODE_CLI_API_KEY", "test-key")
     monkeypatch.setenv("CLAUDE_CODE_CLI_ENGINE", "never")
     monkeypatch.setenv("CLAUDE_CODE_CLI_NATIVE_TOOLS", "1")
-    monkeypatch.setattr(shim, "run_claude", lambda *a, **k: {
-        "text": '```json\n{"tool_calls":[{"name":"terminal","arguments":{"command":"pwd"}]}\n```',
-        "error": None, "model": "claude-fable-5-1", "usage": {}})
+    monkeypatch.setattr(shim, "_run_mcp_cli", lambda *a, **k: {
+        "events": [{"type": "result", "result": '```json\n{"tool_calls":[{"name":"terminal","arguments":{"command":"pwd"}]}\n```',
+                    "modelUsage": {"claude-fable-5-1": {}}, "usage": {}}],
+        "returncode": 0, "stderr": "", "timed_out": False})
     server = ThreadingHTTPServer(("127.0.0.1", 0), shim.Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
