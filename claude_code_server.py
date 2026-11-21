@@ -331,9 +331,13 @@ def _content_to_text(content, images: _ImageCollector | None = None) -> str:
     return str(content)
 
 
-def flatten_messages(messages: list[dict], images: _ImageCollector | None = None,
-                     native_tools: bool = False) -> str:
-    """Render an OpenAI message list into a single prompt for `claude -p`.
+def flatten_message_parts(messages: list[dict], images: _ImageCollector | None = None,
+                          native_tools: bool = False) -> tuple[list[str], str]:
+    """Render an OpenAI message list as ordered prompt blocks plus an instruction.
+
+    :func:`flatten_messages` joins them into the historical single prompt
+    string. The HTTP handler keeps them apart (:class:`StructuredPrompt`) so
+    each conversation entry reaches the CLI as its own content block.
 
     System/developer messages become a leading SYSTEM block; the conversation
     is rendered as labelled turns. Tool messages are folded in as context so
@@ -369,13 +373,14 @@ def flatten_messages(messages: list[dict], images: _ImageCollector | None = None
         else:
             convo.append(f"USER: {text}")
 
-    parts: list[str] = []
+    blocks: list[str] = []
     if system_blocks:
-        parts.append("SYSTEM INSTRUCTIONS:\n" + "\n\n".join(system_blocks))
+        blocks.append("SYSTEM INSTRUCTIONS:\n" + "\n\n".join(system_blocks))
     if convo:
-        parts.append("CONVERSATION:\n" + "\n\n".join(convo))
+        blocks.append("CONVERSATION:\n" + convo[0])
+        blocks.extend(convo[1:])
     if native_tools:
-        parts.append(
+        instruction = (
             "Respond as the assistant to the latest user turn. Tools available for this "
             "request are provided via MCP. When you select one, Hermes executes it outside "
             "this CLI turn and supplies its real result in a subsequent conversation turn; "
@@ -387,11 +392,107 @@ def flatten_messages(messages: list[dict], images: _ImageCollector | None = None
             "Ordinary responses that need no tool can be answered normally."
         )
     else:
-        parts.append(
+        instruction = (
             "Respond as the assistant to the latest user turn. "
             "Return only the response text."
         )
-    return "\n\n".join(parts).strip()
+    return blocks, instruction
+
+
+def flatten_messages(messages: list[dict], images: _ImageCollector | None = None,
+                     native_tools: bool = False) -> str:
+    """Render an OpenAI message list into a single prompt for `claude -p`."""
+    blocks, instruction = flatten_message_parts(messages, images, native_tools=native_tools)
+    return "\n\n".join([*blocks, instruction]).strip()
+
+
+class StructuredPrompt(str):
+    """The legacy prompt string, plus the block structure it was built from.
+
+    Subclassing ``str`` keeps every caller, test and telemetry counter that
+    treats the prompt as text unchanged. Plain string operations (``+``,
+    ``rstrip``) return a plain ``str`` and so fall back to the legacy
+    single-text stdin path; use :func:`_append_prompt_text` to keep structure.
+    """
+
+    def __new__(cls, blocks, instruction: str, text: str | None = None):
+        kept = tuple(b for b in blocks if isinstance(b, str) and b.strip())
+        if text is None:
+            text = "\n\n".join([*kept, instruction]).strip()
+        obj = super().__new__(cls, text)
+        obj.blocks = kept
+        obj.instruction = instruction
+        return obj
+
+    def with_block(self, extra: str) -> "StructuredPrompt":
+        return StructuredPrompt([*self.blocks, extra], self.instruction,
+                                text=str(self).rstrip() + "\n\n" + extra)
+
+
+def _append_prompt_text(prompt, extra: str):
+    """Append an instruction without discarding a structured block layout."""
+    if isinstance(prompt, StructuredPrompt):
+        return prompt.with_block(extra)
+    return prompt.rstrip() + "\n\n" + extra
+
+
+def _structured_input_enabled() -> bool:
+    return _env("CLAUDE_CODE_CLI_STRUCTURED_INPUT", "1").strip().lower() not in {
+        "0", "false", "no", "off", "disabled",
+    }
+
+
+def _prompt_block_cap() -> int:
+    try:
+        return max(2, int(_env("CLAUDE_CODE_CLI_MAX_PROMPT_BLOCKS", "200")))
+    except ValueError:
+        return 200
+
+
+def _group_prompt_blocks(blocks: list[str], cap: int) -> list[str]:
+    """Bound the content-block count without moving earlier boundaries.
+
+    Groups are fixed-size runs counted from the start, so appending entries
+    only changes the last group. The group size grows only when the count
+    crosses a multiple of ``cap``, which costs one cache rewrite at that step.
+    """
+    if len(blocks) <= cap:
+        return list(blocks)
+    size = -(-len(blocks) // cap)
+    return ["\n\n".join(blocks[i:i + size]) for i in range(0, len(blocks), size)]
+
+
+def _cli_input(prompt) -> tuple[list[str], str, bool]:
+    """Return ``(extra_argv, stdin_text, structured)`` for one CLI invocation.
+
+    Prompt caching needs the previous request to be a block-aligned prefix of
+    the next one. One growing text block never is: the old cache entry ends
+    mid-block, so every agent-loop step re-wrote the entire conversation as
+    cache-creation tokens and read back only the CLI's own system prompt.
+    Structured prompts use stream-json input with one content block per
+    conversation entry, and the trailing response instruction moves into the
+    system prompt so the conversation itself stays the tail of the request.
+    """
+    if (isinstance(prompt, StructuredPrompt) and prompt.blocks
+            and _structured_input_enabled()):
+        content = [{"type": "text", "text": block}
+                   for block in _group_prompt_blocks(list(prompt.blocks), _prompt_block_cap())]
+        message = {"type": "user", "message": {"role": "user", "content": content}}
+        extra = ["--input-format", "stream-json"]
+        if prompt.instruction:
+            extra += ["--append-system-prompt", prompt.instruction]
+        return extra, json.dumps(message, ensure_ascii=False) + "\n", True
+    return [], str(prompt), False
+
+
+def _last_stream_result(stdout: str) -> dict | None:
+    """Last terminal ``result`` event from stream-json stdout, if any."""
+    found = None
+    for event in iter_stream_json((stdout or "").splitlines()):
+        if event.get("type") == "result" or (
+                event.get("type") is None and isinstance(event.get("result"), str)):
+            found = event
+    return found
 
 
 def _native_tools_enabled() -> bool:
@@ -816,7 +917,8 @@ def _run_mcp_cli(prompt: str, model: str, config_path: pathlib.Path,
         "_allowed_mcp_tools": allowed_tools,
         "max_turns": "1",
     })
-    argv = build_claude_argv(model, engine=False, overrides=internal, stream=True)
+    cli_extra, stdin_text, _structured = _cli_input(prompt)
+    argv = build_claude_argv(model, engine=False, overrides=internal, stream=True) + cli_extra
     try:
         timeout = int(_env("CLAUDE_CODE_CLI_TIMEOUT", "600"))
     except ValueError:
@@ -839,7 +941,7 @@ def _run_mcp_cli(prompt: str, model: str, config_path: pathlib.Path,
         return {"events": [], "returncode": 126, "stderr": f"claude invocation failed: {exc!r}", "timed_out": False}
     timed_out = False
     try:
-        stdout, stderr = proc.communicate(prompt, timeout=timeout)
+        stdout, stderr = proc.communicate(stdin_text, timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
         try:
@@ -1005,9 +1107,10 @@ def run_claude_mcp_bridge(prompt: str, model: str, tools: list[dict], tool_choic
         if not specs:
             return {"text": "", "usage": _zero_usage(), "error": "unknown required tool",
                     "http_status": 400, "model": "", "tool_calls": []}
-        prompt = prompt.rstrip() + f"\n\nYou must use the available Hermes tool {'mcp__hermes__' + specific!r} for this turn."
+        prompt = _append_prompt_text(
+            prompt, f"You must use the available Hermes tool {'mcp__hermes__' + specific!r} for this turn.")
     elif isinstance(tool_choice, str) and tool_choice.strip().lower() == "required":
-        prompt = prompt.rstrip() + "\n\nYou must use one of the available Hermes tools for this turn."
+        prompt = _append_prompt_text(prompt, "You must use one of the available Hermes tools for this turn.")
     if not specs:
         return {"text": "", "usage": _zero_usage(), "error": "no valid tool schemas",
                 "http_status": 400, "model": "", "tool_calls": []}
@@ -1170,7 +1273,12 @@ def _run_claude_once(prompt: str, model: str, engine: bool = False,
     streaming clients still see something. In engine mode the CLI runs its own
     tools in CLAUDE_CODE_CLI_CWD and may take much longer.
     """
-    argv = build_claude_argv(model, engine, overrides)
+    cli_extra, stdin_text, structured = _cli_input(prompt)
+    argv = build_claude_argv(model, engine, overrides, stream=structured)
+    if structured:
+        # stream-json input requires stream-json output. This path still waits
+        # for the terminal result, so token-level partials are only noise.
+        argv = [arg for arg in argv if arg != "--include-partial-messages"] + cli_extra
     default_timeout = "1200" if engine else "600"
     try:
         timeout = int(_env("CLAUDE_CODE_CLI_TIMEOUT", default_timeout))
@@ -1182,7 +1290,7 @@ def _run_claude_once(prompt: str, model: str, engine: bool = False,
     try:
         proc = subprocess.run(
             argv,
-            input=prompt,
+            input=stdin_text,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -1204,7 +1312,7 @@ def _run_claude_once(prompt: str, model: str, engine: bool = False,
         return {"text": f"[claude-code-cli error] {msg}", "usage": _zero_usage(), "error": msg}
 
     stdout, stderr = proc.stdout or "", proc.stderr or ""
-    parsed = _extract_json_object(stdout)
+    parsed = _last_stream_result(stdout) if structured else _extract_json_object(stdout)
 
     if parsed is not None:
         if parsed.get("is_error"):
@@ -1237,8 +1345,9 @@ def _run_claude_once(prompt: str, model: str, engine: bool = False,
         return {"text": f"[claude-code-cli error] {msg}", "usage": _zero_usage(), "error": msg}
 
     # Exit 0 but unparseable → degrade to raw stdout as the completion text.
+    # Structured runs emit JSONL events; never pass those off as an answer.
     fallback = stdout.strip()
-    if fallback:
+    if fallback and not structured:
         return {"text": fallback, "usage": _zero_usage(), "error": ""}
     msg = "claude returned no output"
     return {"text": f"[claude-code-cli error] {msg}", "usage": _zero_usage(), "error": msg}
@@ -1490,7 +1599,8 @@ def stream_claude(prompt: str, model: str, engine: bool = False,
     ``final`` outcome, mirroring :func:`run_claude`. The prompt is fed on a
     thread and stderr drained on a thread to avoid pipe deadlocks.
     """
-    argv = build_claude_argv(model, engine, overrides, stream=True)
+    cli_extra, stdin_text, _structured = _cli_input(prompt)
+    argv = build_claude_argv(model, engine, overrides, stream=True) + cli_extra
     default_timeout = "1200" if engine else "600"
     try:
         timeout = int(_env("CLAUDE_CODE_CLI_TIMEOUT", default_timeout))
@@ -1523,7 +1633,7 @@ def stream_claude(prompt: str, model: str, engine: bool = False,
     def _feed():
         try:
             if proc.stdin:
-                proc.stdin.write(prompt)
+                proc.stdin.write(stdin_text)
                 proc.stdin.close()
         except (BrokenPipeError, OSError):
             pass
@@ -1983,7 +2093,9 @@ class Handler(BaseHTTPRequestHandler):
 
         images = _ImageCollector()
         try:
-            prompt = flatten_messages(messages, images, native_tools=native_tools)
+            prompt_blocks, response_instruction = flatten_message_parts(
+                messages, images, native_tools=native_tools)
+            prompt = StructuredPrompt(prompt_blocks, response_instruction)
             if engine:
                 prompt += (
                     "\n\nYou are operating as an autonomous coding engine with your own tools "
