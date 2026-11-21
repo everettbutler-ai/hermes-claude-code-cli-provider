@@ -121,6 +121,7 @@ Most users only need the defaults. See `.env.example` for the full list.
 | `CLAUDE_CODE_CLI_ENGINE` | `auto` | `auto`, `always`, or `never`; `always` opts into Claude Code's own tool loop. |
 | `CLAUDE_CODE_CLI_NATIVE_TOOLS` | `1` | Emit OpenAI `tool_calls` so Hermes executes its native tools. |
 | `CLAUDE_CODE_CLI_CWD` | `$HOME` | Working directory for Claude Code engine-mode runs. |
+| `CLAUDE_CODE_CLI_PROMPT_CWD` | `$HERMES_HOME/state/claude-cli-workdir` | Working directory for text and tool-bridge runs. Keep it outside any git repository: Claude Code adds the cwd's git status to every prompt, so repo changes there force a full prompt-cache rewrite on every active session. |
 | `CLAUDE_CODE_CLI_ENGINE_TOOLS` | common file and web tools | Tool allowlist for engine mode. |
 | `CLAUDE_CODE_CLI_STREAM` | `1` | Use live `stream-json` for streaming requests. |
 | `CLAUDE_CODE_CLI_VISION` | `1` | Pass image inputs through when possible. |

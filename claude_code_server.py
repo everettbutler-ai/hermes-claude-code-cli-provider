@@ -856,6 +856,31 @@ def _engine_cwd() -> str:
     return str(cwd) if cwd.is_dir() else str(pathlib.Path.home())
 
 
+def _prompt_cwd() -> str:
+    """Stable working directory for text and tool-bridge CLI calls.
+
+    Claude Code adds its working directory's git status (branch, changed
+    files, recent commits) and cwd-keyed paths to every prompt. The shim runs
+    from its own checkout, so any edit or commit there changed the prefix of
+    every request and forced a full prompt-cache rewrite on every active
+    session. Non-engine calls never touch files, so they run from a fixed
+    directory outside any repository instead.
+    """
+    raw = _env("CLAUDE_CODE_CLI_PROMPT_CWD", "").strip()
+    if raw:
+        path = pathlib.Path(raw).expanduser()
+    else:
+        hermes_home = os.environ.get("HERMES_HOME", "").strip()
+        base = (pathlib.Path(hermes_home).expanduser() if hermes_home
+                else pathlib.Path.home() / ".hermes")
+        path = base / "state" / "claude-cli-workdir"
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return str(path) if path.is_dir() else str(pathlib.Path.home())
+
+
 def _extract_json_object(text: str) -> dict | None:
     text = (text or "").strip()
     if not text:
@@ -933,6 +958,7 @@ def _run_mcp_cli(prompt: str, model: str, config_path: pathlib.Path,
             encoding="utf-8",
             errors="replace",
             env=build_subprocess_env(),
+            cwd=_prompt_cwd(),
             start_new_session=True,
         )
     except FileNotFoundError:
@@ -1284,7 +1310,7 @@ def _run_claude_once(prompt: str, model: str, engine: bool = False,
         timeout = int(_env("CLAUDE_CODE_CLI_TIMEOUT", default_timeout))
     except ValueError:
         timeout = int(default_timeout)
-    cwd = _engine_cwd() if engine else None
+    cwd = _engine_cwd() if engine else _prompt_cwd()
     run_env = dict(subprocess_env) if subprocess_env is not None else build_subprocess_env()
 
     try:
@@ -1606,7 +1632,7 @@ def stream_claude(prompt: str, model: str, engine: bool = False,
         timeout = int(_env("CLAUDE_CODE_CLI_TIMEOUT", default_timeout))
     except ValueError:
         timeout = int(default_timeout)
-    cwd = _engine_cwd() if engine else None
+    cwd = _engine_cwd() if engine else _prompt_cwd()
 
     try:
         proc = subprocess.Popen(
